@@ -8,8 +8,8 @@ Please feel free to leave any feedback :)
   Mice imputation <br />
 
 # Part 2: Predictive Modeling
-  SVM linear <br />
-  SVM polynomial <br />
-  SVM radial <br />
+  SVM Linear <br />
+  SVM Polynomial <br />
+  SVM Radial Basis Function Kernal <br />
   Fine-tuning and exporting results <br />
   
