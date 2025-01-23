@@ -1,0 +1,494 @@
+---
+title: "Titanic SVM"
+author: "Bhuvanesh Wadhwani"
+date: "2023-05-17"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Calling packages 
+```{r Packages, cache = TRUE}
+
+packages_to_use<- c("ROCR", "tidyverse", "caret", "dplyr", "mice", "e1071", "ggplot2", "kernlab")
+
+for(i in packages_to_use){
+  if( ! i %in% rownames(installed.packages())  ) {
+    print(paste(i, "not installed; installing now:\n") )
+    install.packages(i)
+  }
+  
+  require(i, character.only = TRUE)
+}
+
+
+```
+
+# Part 1: Data Cleaning
+#Taking in Datasets
+```{r}
+
+train.dat <- read.csv("train.csv")
+test.dat <- read.csv("test.csv")
+
+combined.dat <- bind_rows(train.dat, test.dat)
+
+str(combined.dat)
+
+
+
+
+```
+
+pclass: A proxy for socio-economic status (SES)
+1st = Upper
+2nd = Middle
+3rd = Lower
+age: Age is fractional if less than 1. If the age is estimated, is it in the form of xx.5
+sibsp: The dataset defines family relations in this way...
+Sibling = brother, sister, stepbrother, stepsister
+Spouse = husband, wife (mistresses and fiancés were ignored)
+parch: The dataset defines family relations in this way...
+Parent = mother, father
+Child = daughter, son, stepdaughter, stepson
+Some children travelled only with a nanny, therefore parch=0 for them.
+
+
+```{r}
+# Grab title from passenger names
+combined.dat$Title <- gsub('(.*, )|(\\..*)', '', combined.dat$Name) #getting titles from name column into a new column 
+
+# Show title counts by sex
+table(combined.dat$Sex, combined.dat$Title)
+```
+
+```{r}
+# Titles with very low cell counts to be combined to "rare" level
+rare_title <- c('Dona', 'Lady', 'the Countess','Capt', 'Col', 'Don', 
+                'Dr', 'Major', 'Rev', 'Sir', 'Jonkheer')
+
+# Also reassign mlle, ms, and mme accordingly
+combined.dat$Title[combined.dat$Title == 'Mlle']        <- 'Miss' 
+combined.dat$Title[combined.dat$Title == 'Ms']          <- 'Miss'
+combined.dat$Title[combined.dat$Title == 'Mme']         <- 'Mrs' 
+combined.dat$Title[combined.dat$Title %in% rare_title]  <- 'Rare Title'
+
+# Show title counts by sex again
+table(combined.dat$Sex, combined.dat$Title)
+
+```
+```{r}
+# Finally, grab surname from passenger name
+combined.dat$Surname <- sapply(combined.dat$Name,  
+                      function(x) strsplit(x, split = '[,.]')[[1]][1])
+```
+
+
+```{r}
+# Create a family size variable including the passenger themselves
+combined.dat$Fsize <- combined.dat$SibSp + combined.dat$Parch + 1
+
+# Create a family variable 
+combined.dat$Family <- paste(combined.dat$Surname, combined.dat$Fsize, sep='_')
+```
+
+
+```{r}
+# Discretize family size
+combined.dat$FsizeD[combined.dat$Fsize == 1] <- 'singleton'
+combined.dat$FsizeD[combined.dat$Fsize < 5 & combined.dat$Fsize > 1] <- 'small'
+combined.dat$FsizeD[combined.dat$Fsize > 4] <- 'large'
+
+# Show family size by survival using a mosaic plot
+mosaicplot(table(combined.dat$FsizeD, combined.dat$Survived), main='Family Size by Survival', shade=TRUE)
+```
+
+
+```{r}
+# Create a Deck variable. Get passenger deck A - F:
+combined.dat$Deck<-factor(sapply(combined.dat$Cabin, function(x) strsplit(x, NULL)[[1]][1]))
+```
+
+```{r}
+# Get rid of our missing passenger IDs
+embark_fare <- combined.dat %>%
+  filter(PassengerId != 62 & PassengerId != 830)
+```
+
+```{r}
+# Since their fare was $80 for 1st class, they most likely embarked from 'C'
+combined.dat$Embarked[c(62, 830)] <- 'C'
+```
+
+
+
+
+```{r}
+combined.dat$Fare[1044] <- median(combined.dat[combined.dat$Pclass == '3' & combined.dat$Embarked == 'S', ]$Fare, na.rm = TRUE)
+```
+
+
+```{r}
+# Make variables factors into factors
+factor_vars <- c('PassengerId','Pclass','Sex','Embarked',
+                 'Title','Surname','Family','FsizeD')
+
+combined.dat[factor_vars] <- lapply(combined.dat[factor_vars], function(x) as.factor(x))
+
+# Set a random seed
+set.seed(129)
+
+# Perform mice imputation, excluding certain less-than-useful variables:
+mice_mod <- mice(combined.dat[, !names(combined.dat) %in% c('PassengerId','Name','Ticket','Cabin','Family','Surname','Survived')], method='rf')
+```
+```{r}
+# Save the complete output 
+mice_output <- complete(mice_mod)
+```
+
+
+```{r}
+# Replace Age variable from the mice model.
+combined.dat$Age <- mice_output$Age
+
+# Show new number of missing Age values
+sum(is.na(combined.dat$Age))
+```
+
+
+
+
+```{r}
+# Create the column child, and indicate whether child or adult
+combined.dat$Child[combined.dat$Age < 18] <- 'Child'
+combined.dat$Child[combined.dat$Age >= 18] <- 'Adult'
+
+# Show counts
+table(combined.dat$Child, combined.dat$Survived)
+```
+
+
+
+```{r}
+# Adding Mother variable
+combined.dat$Mother <- 'Not Mother'
+combined.dat$Mother[combined.dat$Sex == 'female' & combined.dat$Parch > 0 & combined.dat$Age > 18 & combined.dat$Title != 'Miss'] <- 'Mother'
+
+# Show counts
+table(combined.dat$Mother, combined.dat$Survived)
+```
+
+
+
+
+```{r}
+# Finish by factorizing our two new factor variables
+combined.dat$Child  <- factor(combined.dat$Child)
+combined.dat$Mother <- factor(combined.dat$Mother)
+```
+
+
+```{r}
+md.pattern(combined.dat)
+
+```
+
+
+```{r}
+# Split the data back into a train set and a test set
+train.dat <- data.frame(combined.dat[1:891,])
+test.dat <- data.frame(combined.dat[892:1309,])
+```
+
+
+
+
+
+
+
+#Factoring variables in the train dataset
+```{r}
+#Survived
+train.dat$Survived <- factor(train.dat$Survived,
+                       levels = c("0", "1"),
+                       labels = c("No", "Yes"))
+
+#Sex
+train.dat$Sex <- factor(train.dat$Sex,
+                       levels = c("female", "male"),
+                       labels = c("Female", "Male"))
+
+#Pclass
+train.dat$Pclass <- factor(train.dat$Pclass,
+                       levels = c("1", "2", "3"),
+                       labels = c("Upper", "Middle", "Lower"))
+
+#Embarked
+train.dat$Embarked <- factor(train.dat$Embarked,
+                       levels = c("C", "Q", "S"),
+                       labels = c("Cherbourg", "Queenstown", "Southampton"))
+
+
+
+```
+
+
+
+#Factoring variables in the test dataset
+```{r}
+#Survived
+test.dat$Survived <- factor(test.dat$Survived,
+                       levels = c("0", "1"),
+                       labels = c("No", "Yes"))
+
+#Sex
+test.dat$Sex <- factor(test.dat$Sex,
+                       levels = c("female", "male"),
+                       labels = c("Female", "Male"))
+
+#Pclass
+test.dat$Pclass <- factor(test.dat$Pclass,
+                       levels = c("1", "2", "3"),
+                       labels = c("Upper", "Middle", "Lower"))
+
+#Embarked
+test.dat$Embarked <- factor(test.dat$Embarked,
+                       levels = c("C", "Q", "S"),
+                       labels = c("Cherbourg", "Queenstown", "Southampton"))
+
+
+
+```
+
+
+# Part 2: SVM
+```{r Train Control, cache = TRUE}
+my.seed <- 111
+
+set.seed(my.seed)
+tr.Control <- trainControl(method = "repeatedcv",
+                           number = 10,
+                           repeats = 5,
+                           classProbs = TRUE,
+                           summaryFunction = twoClassSummary
+                           )
+
+
+```
+
+# SVM Linear
+```{r}
+set.seed(111)
+svm.linear <- train(Survived ~ Pclass + Sex + Age +SibSp + Parch + Fare + Embarked + Title + FsizeD + Child + Mother,
+                    data = train.dat,
+                    method = "svmLinear",
+                    trControl = tr.Control,
+                    metric = "ROC",
+                    preProcess = c("center", "scale"),
+                    tuneGrid = expand.grid(C = seq(.0001, 2, length = 30))
+                    )
+
+svm.linear$results 
+
+
+
+
+
+
+```
+
+
+
+
+```{r}
+
+svm.linear$bestTune
+#get the best measures:
+best.index <- best(svm.linear$results, metric = "ROC", maximize = TRUE)
+svm.linear$results[best.index, ]
+#OR: 
+svm.linear$results[ which.max(svm.linear$results$ROC), ]
+
+
+svm.linear.pred <- predict(svm.linear, newdata = test.dat)
+
+# Save the solution to a dataframe with two columns: PassengerId and Survived (prediction)
+svm.sol <- data.frame(PassengerID = test.dat$PassengerId, Survived = svm.linear.pred)
+
+# Write the solution to file
+write.csv(svm.sol, file = 'svm_linear.csv', row.names = F)
+
+
+
+
+```
+
+
+
+
+
+
+
+# SVM Polynomial
+```{r}
+
+set.seed(111)
+svm.poly <- train(Survived ~ Pclass + Sex + Age +SibSp + Parch + Fare + Embarked + Title + FsizeD + Child + Mother, 
+              data = train.dat, 
+              method = "svmPoly", 
+              metric = "ROC",
+              trControl = tr.Control, 
+              preProcess = c("center","scale") 
+              # , tuneLength = 15
+              )
+# the best tuning parameter
+svm.poly$bestTune
+
+svm.poly$results[ which.max(svm.poly$results$ROC), ]
+
+
+
+svm.poly.pred <- predict(svm.poly, newdata = test.dat)
+
+# Save the solution to a dataframe with two columns: PassengerId and Survived (prediction)
+svm.pol <- data.frame(PassengerID = test.dat$PassengerId, Survived = svm.poly.pred)
+
+# Write the solution to file
+write.csv(svm.pol, file = 'svm_poly1.csv', row.names = F)
+
+
+```
+
+
+
+```{r}
+plot(svm.poly)
+```
+
+
+```{r}
+#grid search
+set.seed(111) 
+poly.grid <- expand.grid(C = .25,
+                            scale = .001,
+                         degree = seq(3, 5, length.out = 10))
+
+set.seed(111)
+svm.poly2 <- train(Survived ~ Pclass + Sex + Age + SibSp + Parch + 
+                                            Fare + Embarked + Title + 
+                                            FsizeD + Child + Mother, 
+                      data = train.dat, 
+                      method = 'svmPoly', 
+                      trControl = tr.Control,
+                      tuneGrid = poly.grid,
+                      metric = "ROC",
+                      preProcess = c("center", "scale")
+                      )
+
+
+
+
+
+# the best tuning parameter
+svm.poly2$bestTune
+
+svm.poly2$results[ which.max(svm.poly2$results$ROC), ]
+
+
+
+svm.poly.pred2 <- predict(svm.poly2, newdata = test.dat)
+
+# Save the solution to a dataframe with two columns: PassengerId and Survived (prediction)
+svm.pol2 <- data.frame(PassengerID = test.dat$PassengerId, Survived = svm.poly.pred2)
+
+# Write the solution to file
+write.csv(svm.pol2, file = 'svm_poly2.csv', row.names = F)
+
+
+
+```
+
+
+
+# SVM Radial Basis Function Kernal
+```{r}
+
+set.seed(111)
+svm.radial <- train(Survived ~ Pclass + Sex + Age +SibSp + Parch + Fare + Embarked + Title + FsizeD + Child + Mother, 
+              data = train.dat, 
+              method = "svmRadial", 
+              metric = "ROC",
+              trControl = tr.Control, 
+              preProcess = c("center","scale")
+              , tuneGrid = expand.grid(
+                C = seq(0.01, 0.3, length.out = 10) 
+                , sigma = c(0.01, 0.1, 1, 2)
+                )
+              )
+
+svm.radial$bestTune
+svm.radial$results
+svm.radial$results[ which.max(svm.radial$results$ROC), ]
+
+
+
+
+svm.rad.pred <- predict(svm.radial, newdata = test.dat)
+
+# Save the solution to a dataframe with two columns: PassengerId and Survived (prediction)
+svm.rad <- data.frame(PassengerID = test.dat$PassengerId, Survived = svm.rad.pred)
+
+# Write the solution to file
+write.csv(svm.rad, file = 'svm_rad1.csv', row.names = F)
+
+```
+
+
+
+
+
+```{r}
+
+plot(svm.radial)
+
+
+```
+
+
+
+```{r}
+set.seed(111)
+svm.radial2 <- train(Survived ~ Pclass + Sex + Age +SibSp + Parch + Fare + Embarked + Title + FsizeD + Child + Mother, 
+              data = train.dat, 
+              method = "svmRadial", 
+              metric = "ROC",
+              trControl = tr.Control, 
+              preProcess = c("center","scale")
+              , tuneGrid = expand.grid(
+                C = seq(0.01, 0.3, length.out = 10) 
+                , sigma = seq(0.001, 0.1, length.out = 10)
+                )
+              )
+
+svm.radial2$bestTune
+svm.radial2$results
+svm.radial2$results[ which.max(svm.radial2$results$ROC), ]
+
+
+
+
+svm.rad.pred2 <- predict(svm.radial2, newdata = test.dat)
+
+# Save the solution to a dataframe with two columns: PassengerId and Survived (prediction)
+svm.rad2 <- data.frame(PassengerID = test.dat$PassengerId, Survived = svm.rad.pred2)
+
+# Write the solution to file
+write.csv(svm.rad2, file = 'svm_rad2.csv', row.names = F)
+```
+
+
+
+
+
